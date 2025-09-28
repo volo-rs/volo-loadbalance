@@ -1,6 +1,19 @@
 [package]
 name = "volo-loadbalance"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Load balancing algorithms for Volo: RR, WRR, P2C, WeightedRandom, LeastConn, RTWeighted, ConsistentHash"
+repository = "https://github.com/volo-rs/volo-loadbalance"
 
 [dependencies]
+rand = { version = "0.8.5", features = ["std"] }
+parking_lot = "0.12"
+ahash = "0.8"
+thiserror = "1.0.56"
+volo = { version = "0.11.1", optional = true }
+
+[features]
+default = []
+volo-adapter = ["volo"]
+
