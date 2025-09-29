@@ -11,23 +11,23 @@ pub struct Endpoint {
 
 #[derive(Debug)]
 pub struct Node {
-	pub endpoint: Endpoint,
-	pub weight: u32,
-	pub in_flight: AtomicUsize,
-	pub success: AtomicU64,
-	pub fail: AtomicU64,
-	pub last_rtt_ns: AtomicU64,
+    pub endpoint: Endpoint,
+    pub weight: u32,
+    pub in_flight: AtomicUsize,
+    pub success: AtomicU64,
+    pub fail: AtomicU64,
+    pub last_rtt_ns: AtomicU64,
 }
 
 impl Node {
-	pub fn new(endpoint: Endpoint, weight: u32) -> Self {
-		Self {
-			endpoint,
-			weight,
-			in_flight: AtomicUsize::new(0),
-			success: AtomicU64::new(0),
-			fail: AtomicU64::new(0),
-			last_rtt_ns: AtomicU64::new(0),
-		}
-	}
-} 
+    pub fn new(endpoint: Endpoint, weight: u32) -> Self {
+        Self {
+            endpoint,
+            weight,
+            in_flight: AtomicUsize::new(0),
+            success: AtomicU64::new(0),
+            fail: AtomicU64::new(0),
+            last_rtt_ns: AtomicU64::new(0),
+        }
+    }
+}

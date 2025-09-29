@@ -5,9 +5,8 @@ pub mod node;
 pub mod strategy;
 
 pub use strategy::{
-    BaseBalancer, BalanceStrategy, Picker, RequestMetadata,
-    RoundRobin, WeightedRoundRobin, PowerOfTwoChoices, WeightedRandom,
-    LeastConnection, ResponseTimeWeighted, ConsistentHash,
+    BalanceStrategy, BaseBalancer, ConsistentHash, LeastConnection, Picker, PowerOfTwoChoices,
+    RequestMetadata, ResponseTimeWeighted, RoundRobin, WeightedRandom, WeightedRoundRobin,
 };
 
 #[cfg(feature = "volo-adapter")]

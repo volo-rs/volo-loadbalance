@@ -13,7 +13,11 @@ ahash = "0.8"
 thiserror = "1.0.56"
 volo = { version = "0.11.1", optional = true }
 
+[dev-dependencies]
+tokio = { version = "1.0", features = ["full"] }
+async-broadcast = "0.7.0"
+
 [features]
-default = []
+default = ["volo-adapter"]
 volo-adapter = ["volo"]
 
