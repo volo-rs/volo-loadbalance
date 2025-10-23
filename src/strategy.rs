@@ -317,7 +317,7 @@ impl Picker for LeastConnPicker {
 /// - Weighted selection based on node's recent response time (RTT)
 /// - Smaller RTT means higher weight
 /// - Also considers current load (in_flight)
-/// - Performance optimization: pre-calculates all node scores and sorts them
+/// - Performance optimization: scans nodes once to find the highest score
 #[derive(Clone, Debug)]
 pub struct ResponseTimeWeighted;
 
@@ -341,15 +341,18 @@ impl Picker for RTWeightedPicker {
             return Ok(self.nodes[0].clone());
         }
 
-        // Pre-calculate scores for all nodes
-        let mut scores: Vec<(f64, Arc<Node>)> =
-            self.nodes.iter().map(|n| (score(n), n.clone())).collect();
+        let mut best_node = self.nodes[0].clone();
+        let mut best_score = score(&self.nodes[0]);
 
-        // Sort by score in descending order
-        scores.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        for node in self.nodes.iter().skip(1) {
+            let current_score = score(node);
+            if current_score > best_score {
+                best_score = current_score;
+                best_node = node.clone();
+            }
+        }
 
-        // Select the node with the highest score
-        Ok(scores[0].1.clone())
+        Ok(best_node)
     }
 }
 
@@ -406,7 +409,7 @@ impl ConsistentHashPicker {
 
             for j in 0..vnode_count {
                 // Generate hash value using node address and virtual node index
-                let key = format!("{node:p}:{j}");
+                let key = format!("{}:{j}", node.endpoint.id);
                 let hash = hash_str(&key);
                 ring.push((hash, i));
             }
