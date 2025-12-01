@@ -2,6 +2,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use ahash::AHasher;
+use std::hash::{Hash, Hasher};
+
 use volo::discovery::{Change, Discover, Instance};
 use volo::net::Address;
 
@@ -30,7 +33,7 @@ impl<S: BalanceStrategy> VoloLoadBalancer<S> {
             .iter()
             .map(|instance| {
                 let endpoint = crate::node::Endpoint {
-                    id: 0, // Use the hash of the address as the ID
+                    id: hash_address(&instance.address),
                     address: instance.address.clone(),
                 };
                 let weight = instance.weight;
@@ -39,8 +42,8 @@ impl<S: BalanceStrategy> VoloLoadBalancer<S> {
             .collect()
     }
 
-    fn get_cache_key(&self, endpoint: &volo::context::Endpoint) -> String {
-        format!("{}", endpoint.service_name)
+    fn get_cache_key(&self, endpoint: &volo::context::Endpoint, signature: u64) -> String {
+        format!("{}#{}", endpoint.service_name, signature)
     }
 }
 
@@ -54,9 +57,16 @@ impl<S: BalanceStrategy + 'static> LoadBalance<volo::discovery::StaticDiscover>
         endpoint: &volo::context::Endpoint,
         discover: &volo::discovery::StaticDiscover,
     ) -> Result<Self::InstanceIter, LoadBalanceError> {
-        let key = self.get_cache_key(endpoint);
+        // Get instances from service discovery
+        let instances = discover
+            .discover(endpoint)
+            .await
+            .map_err(|e| LoadBalanceError::Discover(Box::new(e)))?;
 
-        // Check cache
+        let signature = instances_signature(&instances);
+        let key = self.get_cache_key(endpoint, signature);
+
+        // Check cache (snapshot-aware)
         {
             let cache = self.picker_cache.read();
             if let Some(picker) = cache.get(&key) {
@@ -65,12 +75,6 @@ impl<S: BalanceStrategy + 'static> LoadBalance<volo::discovery::StaticDiscover>
                 });
             }
         }
-
-        // Get instances from service discovery
-        let instances = discover
-            .discover(endpoint)
-            .await
-            .map_err(|e| LoadBalanceError::Discover(Box::new(e)))?;
 
         if instances.is_empty() {
             // When no available instances are found, return a custom error
@@ -148,4 +152,19 @@ pub fn response_time_weighted() -> VoloLoadBalancer<crate::strategy::ResponseTim
 
 pub fn consistent_hash() -> VoloLoadBalancer<crate::strategy::ConsistentHash> {
     VoloLoadBalancer::new(crate::strategy::ConsistentHash::default())
+}
+
+fn hash_address(addr: &Address) -> u64 {
+    let mut h = AHasher::default();
+    format!("{addr:?}").hash(&mut h);
+    h.finish()
+}
+
+fn instances_signature(instances: &[Arc<Instance>]) -> u64 {
+    let mut h = AHasher::default();
+    for inst in instances {
+        format!("{:?}", inst.address).hash(&mut h);
+        inst.weight.hash(&mut h);
+    }
+    h.finish()
 }
