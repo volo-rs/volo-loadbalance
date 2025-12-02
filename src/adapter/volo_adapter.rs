@@ -16,6 +16,7 @@ type DiscoverKey = <volo::discovery::StaticDiscover as Discover>::Key;
 
 struct PickerCacheEntry {
     picker: Arc<dyn crate::strategy::Picker>,
+    signature: u64,
 }
 
 /// Volo LoadBalancer Adapter
@@ -209,23 +210,27 @@ impl<S: BalanceStrategy + 'static> LoadBalance<volo::discovery::StaticDiscover>
         discover: &volo::discovery::StaticDiscover,
     ) -> Result<Self::InstanceIter, LoadBalanceError> {
         let discover_key = discover.key(endpoint);
-        let cache_key = self.get_cache_key(endpoint, &discover_key);
 
-        // Check cache
-        {
-            let cache = self.picker_cache.read();
-            if let Some(entry) = cache.get(&cache_key) {
-                return Ok(VoloInstanceIter {
-                    picker: entry.picker.clone(),
-                });
-            }
-        }
-
-        // Get instances from service discovery
+        // Get instances from service discovery first to avoid stale cache
         let instances = discover
             .discover(endpoint)
             .await
             .map_err(|e| LoadBalanceError::Discover(Box::new(e)))?;
+
+        let signature = instances_signature(&instances);
+        let cache_key = self.get_cache_key(endpoint, &discover_key);
+
+        // Check cache with signature guard
+        {
+            let cache = self.picker_cache.read();
+            if let Some(entry) = cache.get(&cache_key) {
+                if entry.signature == signature {
+                    return Ok(VoloInstanceIter {
+                        picker: entry.picker.clone(),
+                    });
+                }
+            }
+        }
 
         if instances.is_empty() {
             // When no available instances are found, return a custom error
@@ -250,6 +255,7 @@ impl<S: BalanceStrategy + 'static> LoadBalance<volo::discovery::StaticDiscover>
                 cache_key.clone(),
                 PickerCacheEntry {
                     picker: picker.clone(),
+                    signature,
                 },
             );
         }
@@ -308,4 +314,21 @@ pub fn response_time_weighted() -> VoloLoadBalancer<crate::strategy::ResponseTim
 
 pub fn consistent_hash() -> VoloLoadBalancer<crate::strategy::ConsistentHash> {
     VoloLoadBalancer::new(crate::strategy::ConsistentHash::default())
+}
+
+fn instances_signature(instances: &[Arc<Instance>]) -> u64 {
+    let mut h = AHasher::default();
+    for inst in instances {
+        format!("{:?}", inst.address).hash(&mut h);
+        inst.weight.hash(&mut h);
+        if !inst.tags.is_empty() {
+            let mut tags: Vec<_> = inst.tags.iter().collect();
+            tags.sort_by(|a, b| a.0.cmp(b.0).then_with(|| a.1.cmp(b.1)));
+            for (k, v) in tags {
+                k.hash(&mut h);
+                v.hash(&mut h);
+            }
+        }
+    }
+    h.finish()
 }

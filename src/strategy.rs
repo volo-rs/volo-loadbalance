@@ -317,7 +317,7 @@ impl Picker for LeastConnPicker {
 /// - Weighted selection based on node's recent response time (RTT)
 /// - Smaller RTT means higher weight
 /// - Also considers current load (in_flight)
-/// - Performance optimization: scans nodes once to find the highest score
+/// - Performance optimization: single-pass scan to find the highest score (O(n))
 #[derive(Clone, Debug)]
 pub struct ResponseTimeWeighted;
 
@@ -337,17 +337,17 @@ impl Picker for RTWeightedPicker {
         if len == 0 {
             return Err(LoadBalanceError::NoAvailableNodes);
         }
-        if len == 1 {
-            return Ok(self.nodes[0].clone());
-        }
 
-        let mut best_node = self.nodes[0].clone();
-        let mut best_score = score(&self.nodes[0]);
+        // Single pass O(n) selection; avoids allocation + sort on every pick
+        let mut iter = self.nodes.iter();
+        let first = iter.next().unwrap();
+        let mut best_node = first.clone();
+        let mut best_score = score(first);
 
-        for node in self.nodes.iter().skip(1) {
-            let current_score = score(node);
-            if current_score > best_score {
-                best_score = current_score;
+        for node in iter {
+            let s = score(node);
+            if s > best_score {
+                best_score = s;
                 best_node = node.clone();
             }
         }
@@ -402,14 +402,33 @@ impl ConsistentHashPicker {
     fn new(nodes: Arc<Vec<Arc<Node>>>, virtual_factor: usize) -> Self {
         let mut ring = Vec::new();
 
+        // Normalize weights to avoid exploding virtual nodes when weights are large.
+        let weights: Vec<usize> = nodes.iter().map(|n| n.weight.max(1) as usize).collect();
+        let gcd_w = weights
+            .iter()
+            .copied()
+            .fold(
+                0usize,
+                |acc, w| if acc == 0 { w } else { gcd_usize(acc, w) },
+            )
+            .max(1);
+
+        // Hard cap to keep ring size reasonable while preserving relative weights.
+        const MAX_VNODE_PER_NODE: usize = 1024;
+
         // Create virtual nodes for each node
         for (i, node) in nodes.iter().enumerate() {
-            let weight = node.weight.max(1) as usize; // Ensure weight is at least 1
-            let vnode_count = weight * virtual_factor;
+            let normalized = (weights[i] / gcd_w).max(1);
+            let vnode_count = normalized
+                .saturating_mul(virtual_factor)
+                .min(MAX_VNODE_PER_NODE)
+                .max(1);
+
+            let base_key = stable_node_key(node, i);
 
             for j in 0..vnode_count {
                 // Generate hash value using node address and virtual node index
-                let key = format!("{}:{j}", node.endpoint.id);
+                let key = format!("{base_key}#{j}");
                 let hash = hash_str(&key);
                 ring.push((hash, i));
             }
@@ -463,6 +482,28 @@ fn hash_str(s: &str) -> u64 {
     h.finish()
 }
 
+fn gcd_usize(a: usize, b: usize) -> usize {
+    if b == 0 {
+        a
+    } else {
+        gcd_usize(b, a % b)
+    }
+}
+
+fn stable_node_key(node: &Arc<Node>, idx: usize) -> String {
+    let addr = format_address(&node.endpoint.address);
+    format!("id:{}|addr:{}|idx:{idx}", node.endpoint.id, addr)
+}
+
+#[cfg(feature = "volo-adapter")]
+fn format_address(addr: &volo::net::Address) -> String {
+    format!("{addr:?}")
+}
+
+#[cfg(not(feature = "volo-adapter"))]
+fn format_address(addr: &String) -> String {
+    addr.clone()
+}
 #[cfg(test)]
 mod tests {
     use super::*;
