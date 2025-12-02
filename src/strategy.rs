@@ -317,7 +317,7 @@ impl Picker for LeastConnPicker {
 /// - Weighted selection based on node's recent response time (RTT)
 /// - Smaller RTT means higher weight
 /// - Also considers current load (in_flight)
-/// - Performance optimization: pre-calculates all node scores and sorts them
+/// - Performance optimization: single-pass scan to find the highest score (O(n))
 #[derive(Clone, Debug)]
 pub struct ResponseTimeWeighted;
 
@@ -339,18 +339,20 @@ impl Picker for RTWeightedPicker {
         }
 
         // Single pass O(n) selection; avoids allocation + sort on every pick
-        let mut best_score = f64::MIN;
-        let mut best_node: Option<Arc<Node>> = None;
+        let mut iter = self.nodes.iter();
+        let first = iter.next().unwrap();
+        let mut best_node = first.clone();
+        let mut best_score = score(first);
 
-        for node in self.nodes.iter() {
+        for node in iter {
             let s = score(node);
             if s > best_score {
                 best_score = s;
-                best_node = Some(node.clone());
+                best_node = node.clone();
             }
         }
 
-        best_node.ok_or(LoadBalanceError::NoAvailableNodes)
+        Ok(best_node)
     }
 }
 
@@ -405,10 +407,7 @@ impl ConsistentHashPicker {
         let gcd_w = weights
             .iter()
             .copied()
-            .fold(
-                0usize,
-                |acc, w| if acc == 0 { w } else { gcd_usize(acc, w) },
-            )
+            .fold(0usize, |acc, w| if acc == 0 { w } else { gcd_usize(acc, w) })
             .max(1);
 
         // Hard cap to keep ring size reasonable while preserving relative weights.
@@ -480,6 +479,7 @@ fn hash_str(s: &str) -> u64 {
     h.finish()
 }
 
+<<<<<<< HEAD
 fn gcd_usize(a: usize, b: usize) -> usize {
     if b == 0 {
         a
@@ -502,7 +502,6 @@ fn format_address(addr: &volo::net::Address) -> String {
 fn format_address(addr: &String) -> String {
     addr.clone()
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
