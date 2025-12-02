@@ -407,7 +407,10 @@ impl ConsistentHashPicker {
         let gcd_w = weights
             .iter()
             .copied()
-            .fold(0usize, |acc, w| if acc == 0 { w } else { gcd_usize(acc, w) })
+            .fold(
+                0usize,
+                |acc, w| if acc == 0 { w } else { gcd_usize(acc, w) },
+            )
             .max(1);
 
         // Hard cap to keep ring size reasonable while preserving relative weights.
@@ -479,7 +482,6 @@ fn hash_str(s: &str) -> u64 {
     h.finish()
 }
 
-<<<<<<< HEAD
 fn gcd_usize(a: usize, b: usize) -> usize {
     if b == 0 {
         a
