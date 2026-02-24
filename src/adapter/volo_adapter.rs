@@ -176,24 +176,20 @@ impl<S: BalanceStrategy> VoloLoadBalancer<S> {
             return;
         }
 
+        // Sync node state for all affected cache keys.
         for cache_key in &cache_keys {
             self.sync_instances(cache_key, &changes.all);
         }
 
+        // Invalidate cached pickers so they are rebuilt on next get_picker call.
+        // NOTE: key_index entries are intentionally preserved so that future
+        // rebalance calls for the same discover_key still find the affected
+        // cache keys. Removing them here would silently break subsequent
+        // rebalances.
         {
             let mut cache = self.picker_cache.write();
             for cache_key in &cache_keys {
                 cache.remove(cache_key);
-            }
-        }
-
-        let mut index = self.key_index.write();
-        if let Some(set) = index.get_mut(&changes.key) {
-            for cache_key in &cache_keys {
-                set.remove(cache_key);
-            }
-            if set.is_empty() {
-                index.remove(&changes.key);
             }
         }
     }
@@ -225,9 +221,7 @@ impl<S: BalanceStrategy + 'static> LoadBalance<volo::discovery::StaticDiscover>
             let cache = self.picker_cache.read();
             if let Some(entry) = cache.get(&cache_key) {
                 if entry.signature == signature {
-                    return Ok(VoloInstanceIter {
-                        picker: entry.picker.clone(),
-                    });
+                    return Ok(VoloInstanceIter::new(entry.picker.clone()));
                 }
             }
         }
@@ -262,7 +256,7 @@ impl<S: BalanceStrategy + 'static> LoadBalance<volo::discovery::StaticDiscover>
 
         self.update_key_index(discover_key, cache_key);
 
-        Ok(VoloInstanceIter { picker })
+        Ok(VoloInstanceIter::new(picker))
     }
 
     fn rebalance(&self, changes: Change<<volo::discovery::StaticDiscover as Discover>::Key>) {
@@ -273,13 +267,40 @@ impl<S: BalanceStrategy + 'static> LoadBalance<volo::discovery::StaticDiscover>
 /// Volo Instance Iterator
 pub struct VoloInstanceIter {
     picker: Arc<dyn crate::strategy::Picker>,
+    /// Optional hash key for consistent-hash strategy. When set, each call to
+    /// `next()` will forward this key to the picker so that ConsistentHash can
+    /// route deterministically instead of always failing with MissingHashKey.
+    hash_key: Option<u64>,
+}
+
+impl VoloInstanceIter {
+    /// Create a new `VoloInstanceIter` from a picker.
+    pub fn new(picker: Arc<dyn crate::strategy::Picker>) -> Self {
+        Self {
+            picker,
+            hash_key: None,
+        }
+    }
+
+    /// 设置一致性哈希路由的 hash key（builder 风格）。
+    pub fn with_hash_key(mut self, key: u64) -> Self {
+        self.hash_key = Some(key);
+        self
+    }
+
+    /// 设置或清除 hash key。
+    pub fn set_hash_key(&mut self, key: Option<u64>) {
+        self.hash_key = key;
+    }
 }
 
 impl Iterator for VoloInstanceIter {
     type Item = Address;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let req = RequestMetadata { hash_key: None };
+        let req = RequestMetadata {
+            hash_key: self.hash_key,
+        };
         match self.picker.pick(&req) {
             Ok(node) => Some(node.endpoint.address.clone()),
             Err(_) => None,
@@ -319,7 +340,9 @@ pub fn consistent_hash() -> VoloLoadBalancer<crate::strategy::ConsistentHash> {
 fn instances_signature(instances: &[Arc<Instance>]) -> u64 {
     let mut h = AHasher::default();
     for inst in instances {
-        format!("{:?}", inst.address).hash(&mut h);
+        // Use Hash trait consistently (same as compute_instance_id) instead of
+        // Debug formatting, which could diverge for identical addresses.
+        inst.address.hash(&mut h);
         inst.weight.hash(&mut h);
         if !inst.tags.is_empty() {
             let mut tags: Vec<_> = inst.tags.iter().collect();

@@ -79,6 +79,29 @@ mod tests {
         ]
     }
 
+
+    fn create_nodes_with_weights(weights: &[u32]) -> Vec<Arc<Node>> {
+        weights
+            .iter()
+            .enumerate()
+            .map(|(i, weight)| {
+                Arc::new(Node::new(
+                    Endpoint {
+                        id: (i + 1) as u64,
+                        #[cfg(feature = "volo-adapter")]
+                        address: format!("127.0.0.1:{}", 9000 + i)
+                            .parse::<std::net::SocketAddr>()
+                            .unwrap()
+                            .into(),
+                        #[cfg(not(feature = "volo-adapter"))]
+                        address: format!("127.0.0.1:{}", 9000 + i),
+                    },
+                    *weight,
+                ))
+            })
+            .collect()
+    }
+
     #[test]
     fn test_round_robin_basic() {
         let nodes = create_test_nodes(3, 1);
@@ -134,6 +157,39 @@ mod tests {
         assert!(*count1 > 80 && *count1 < 120); // Node 1 selected ~100 times
         assert!(*count2 > 180 && *count2 < 220); // Node 2 selected ~200 times
         assert!(*count3 > 280 && *count3 < 320); // Node 3 selected ~300 times
+    }
+
+
+    #[test]
+    fn test_weighted_round_robin_zero_weight_nodes_are_skipped() {
+        let nodes = create_nodes_with_weights(&[0, 5, 0]);
+        let strategy = WeightedRoundRobin;
+        let picker = strategy.build_picker(Arc::new(nodes));
+        let req = RequestMetadata { hash_key: None };
+
+        for _ in 0..128 {
+            let node = picker.pick(&req).unwrap();
+            assert_eq!(node.endpoint.id, 2);
+        }
+    }
+
+    #[test]
+    fn test_weighted_round_robin_handles_large_weights() {
+        let nodes = create_nodes_with_weights(&[u32::MAX, 1]);
+        let strategy = WeightedRoundRobin;
+        let picker = strategy.build_picker(Arc::new(nodes));
+        let req = RequestMetadata { hash_key: None };
+
+        let mut saw_heavy_node = false;
+        for _ in 0..64 {
+            let node = picker.pick(&req).unwrap();
+            assert!(node.endpoint.id == 1 || node.endpoint.id == 2);
+            if node.endpoint.id == 1 {
+                saw_heavy_node = true;
+            }
+        }
+
+        assert!(saw_heavy_node, "largest-weight node should be reachable");
     }
 
     #[test]
@@ -251,6 +307,26 @@ mod tests {
         assert_eq!(node.endpoint.id, 2); // Node 2 has the shortest response time
     }
 
+
+    #[test]
+    fn test_response_time_weighted_prefers_lower_rtt_when_load_equal() {
+        let nodes = create_test_nodes(2, 1);
+        let strategy = ResponseTimeWeighted;
+        let picker = strategy.build_picker(Arc::new(nodes.clone()));
+        let req = RequestMetadata { hash_key: None };
+
+        // Both values round down to 12 in integer division, but node 1 is truly faster.
+        nodes[0]
+            .last_rtt_ns
+            .store(83_333_333, std::sync::atomic::Ordering::Relaxed);
+        nodes[1]
+            .last_rtt_ns
+            .store(80_000_001, std::sync::atomic::Ordering::Relaxed);
+
+        let node = picker.pick(&req).unwrap();
+        assert_eq!(node.endpoint.id, 1);
+    }
+
     #[test]
     fn test_consistent_hash_basic() {
         let nodes = create_test_nodes(3, 1);
@@ -290,6 +366,47 @@ mod tests {
         let result = picker.pick(&req);
 
         assert!(matches!(result, Err(LoadBalanceError::MissingHashKey)));
+    }
+
+
+    #[test]
+    fn test_consistent_hash_node_reordering_keeps_mapping_stable() {
+        let strategy = ConsistentHash {
+            virtual_factor: 160,
+        };
+
+        let build_nodes = |order: &[u16]| {
+            order
+                .iter()
+                .map(|offset| {
+                    Arc::new(Node::new(
+                        Endpoint {
+                            id: (*offset as u64) + 1,
+                            #[cfg(feature = "volo-adapter")]
+                            address: format!("127.0.0.1:{}", 10000 + offset)
+                                .parse::<std::net::SocketAddr>()
+                                .unwrap()
+                                .into(),
+                            #[cfg(not(feature = "volo-adapter"))]
+                            address: format!("127.0.0.1:{}", 10000 + offset),
+                        },
+                        1,
+                    ))
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let picker_a = strategy.build_picker(Arc::new(build_nodes(&[0, 1, 2, 3])));
+        let picker_b = strategy.build_picker(Arc::new(build_nodes(&[2, 0, 3, 1])));
+
+        for key in 0..500u64 {
+            let req = RequestMetadata {
+                hash_key: Some(key),
+            };
+            let id_a = picker_a.pick(&req).unwrap().endpoint.id;
+            let id_b = picker_b.pick(&req).unwrap().endpoint.id;
+            assert_eq!(id_a, id_b, "mapping changed for key {}", key);
+        }
     }
 
     #[test]
@@ -338,5 +455,196 @@ mod tests {
         // Test cloning
         let cloned = metadata.clone();
         assert_eq!(cloned.hash_key, Some(42));
+    }
+
+    #[test]
+    fn test_round_robin_wrapping_behavior() {
+        let nodes = create_test_nodes(3, 1);
+        let strategy = RoundRobin;
+        let picker = strategy.build_picker(Arc::new(nodes.clone()));
+
+        let req = RequestMetadata { hash_key: None };
+        let mut counts = [0usize; 3];
+        let iterations = 3000;
+
+        for _ in 0..iterations {
+            let node = picker.pick(&req).unwrap();
+            counts[node.endpoint.id as usize] += 1;
+        }
+
+        // After many picks each node should be chosen exactly iterations/3 times.
+        for c in &counts {
+            assert_eq!(*c, iterations / 3);
+        }
+    }
+
+    #[test]
+    fn test_wrr_all_zero_weights() {
+        // All nodes have weight 0 — should degrade to simple round-robin.
+        let nodes: Vec<Arc<Node>> = (0..3)
+            .map(|i| {
+                let endpoint = Endpoint {
+                    id: i as u64,
+                    #[cfg(feature = "volo-adapter")]
+                    address: format!("127.0.0.1:{}", 9000 + i)
+                        .parse::<std::net::SocketAddr>()
+                        .unwrap()
+                        .into(),
+                    #[cfg(not(feature = "volo-adapter"))]
+                    address: format!("127.0.0.1:{}", 9000 + i),
+                };
+                Arc::new(Node::new(endpoint, 0))
+            })
+            .collect();
+
+        let strategy = WeightedRoundRobin;
+        let picker = strategy.build_picker(Arc::new(nodes.clone()));
+        let req = RequestMetadata { hash_key: None };
+
+        let mut counts = [0usize; 3];
+        for _ in 0..300 {
+            let node = picker.pick(&req).unwrap();
+            counts[node.endpoint.id as usize] += 1;
+        }
+        // Each node should get exactly 100 picks (simple round-robin).
+        for c in &counts {
+            assert_eq!(*c, 100);
+        }
+    }
+
+    #[test]
+    fn test_wrr_mixed_weights_with_zeros() {
+        // Nodes with weight 0 should never be selected in WRR.
+        let nodes: Vec<Arc<Node>> = vec![
+            Arc::new(Node::new(
+                Endpoint {
+                    id: 0,
+                    #[cfg(feature = "volo-adapter")]
+                    address: "127.0.0.1:9100"
+                        .parse::<std::net::SocketAddr>()
+                        .unwrap()
+                        .into(),
+                    #[cfg(not(feature = "volo-adapter"))]
+                    address: "127.0.0.1:9100".to_string(),
+                },
+                0,
+            )),
+            Arc::new(Node::new(
+                Endpoint {
+                    id: 1,
+                    #[cfg(feature = "volo-adapter")]
+                    address: "127.0.0.1:9101"
+                        .parse::<std::net::SocketAddr>()
+                        .unwrap()
+                        .into(),
+                    #[cfg(not(feature = "volo-adapter"))]
+                    address: "127.0.0.1:9101".to_string(),
+                },
+                10,
+            )),
+            Arc::new(Node::new(
+                Endpoint {
+                    id: 2,
+                    #[cfg(feature = "volo-adapter")]
+                    address: "127.0.0.1:9102"
+                        .parse::<std::net::SocketAddr>()
+                        .unwrap()
+                        .into(),
+                    #[cfg(not(feature = "volo-adapter"))]
+                    address: "127.0.0.1:9102".to_string(),
+                },
+                0,
+            )),
+        ];
+
+        let strategy = WeightedRoundRobin;
+        let picker = strategy.build_picker(Arc::new(nodes.clone()));
+        let req = RequestMetadata { hash_key: None };
+
+        for _ in 0..200 {
+            let node = picker.pick(&req).unwrap();
+            assert_eq!(node.endpoint.id, 1, "only the node with weight > 0 should be picked");
+        }
+    }
+
+    #[test]
+    fn test_p2c_with_two_nodes() {
+        let nodes = create_test_nodes(2, 1);
+
+        // Give node 0 high load, node 1 no load.
+        nodes[0]
+            .in_flight
+            .store(100, std::sync::atomic::Ordering::Relaxed);
+        nodes[1]
+            .in_flight
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+
+        let strategy = PowerOfTwoChoices;
+        let picker = strategy.build_picker(Arc::new(nodes.clone()));
+        let req = RequestMetadata { hash_key: None };
+
+        // With two nodes P2C always compares the only two candidates.
+        // The lighter node (id=1) must always win.
+        for _ in 0..100 {
+            let node = picker.pick(&req).unwrap();
+            assert_eq!(node.endpoint.id, 1);
+        }
+    }
+
+    #[test]
+    fn test_consistent_hash_different_virtual_factors() {
+        let nodes = create_test_nodes(3, 1);
+        let req = RequestMetadata {
+            hash_key: Some(99999),
+        };
+
+        for vf in [1, 10, 100, 500] {
+            let strategy = ConsistentHash {
+                virtual_factor: vf,
+            };
+            let picker = strategy.build_picker(Arc::new(nodes.clone()));
+
+            // Same key must always map to the same node within a single ring.
+            let first = picker.pick(&req).unwrap().endpoint.id;
+            for _ in 0..50 {
+                assert_eq!(picker.pick(&req).unwrap().endpoint.id, first);
+            }
+        }
+    }
+
+    #[test]
+    fn test_consistent_hash_weighted_nodes() {
+        // Node weights: 10, 20, 30 — heavier nodes should get proportionally more traffic.
+        let nodes = create_weighted_test_nodes();
+        let strategy = ConsistentHash {
+            virtual_factor: 200,
+        };
+        let picker = strategy.build_picker(Arc::new(nodes.clone()));
+
+        let mut counts = HashMap::new();
+        let total_keys = 10_000u64;
+        for k in 0..total_keys {
+            let req = RequestMetadata {
+                hash_key: Some(k),
+            };
+            let id = picker.pick(&req).unwrap().endpoint.id;
+            *counts.entry(id).or_insert(0usize) += 1;
+        }
+
+        let c1 = *counts.get(&1).unwrap_or(&0) as f64;
+        let c2 = *counts.get(&2).unwrap_or(&0) as f64;
+        let c3 = *counts.get(&3).unwrap_or(&0) as f64;
+        let total = c1 + c2 + c3;
+
+        // With weights 10:20:30 normalised to 1:2:3, expected ratios ≈ 1/6, 2/6, 3/6.
+        // Consistent hashing is not perfectly uniform, so allow generous tolerance (±15%).
+        assert!(
+            c3 / total > c1 / total,
+            "heaviest node should get more traffic than lightest"
+        );
+        assert!(
+            c2 / total > c1 / total,
+            "middle node should get more traffic than lightest"
+        );
     }
 }

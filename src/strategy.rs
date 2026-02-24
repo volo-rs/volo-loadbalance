@@ -71,13 +71,9 @@ impl Picker for RoundRobinPicker {
 
         let mut g = self.idx.lock();
         let i = *g % len;
-
-        // Handle possible overflow, reset to 0 when approaching usize::MAX
-        if *g == usize::MAX {
-            *g = 0;
-        } else {
-            *g += 1;
-        }
+        // Wrapping add avoids the overflow edge case where resetting to 0
+        // would cause the same index to be picked twice in a row.
+        *g = g.wrapping_add(1);
 
         Ok(self.nodes[i].clone())
     }
@@ -94,8 +90,7 @@ impl BalanceStrategy for WeightedRoundRobin {
 
 struct WRRPicker {
     nodes: Arc<Vec<Arc<Node>>>,
-    cw: parking_lot::Mutex<i32>,
-    idx: parking_lot::Mutex<usize>,
+    state: parking_lot::Mutex<(usize, i32)>, // (idx, current_weight)
     max_w: i32,
     gcd_w: i32,
     weights: Vec<i32>,
@@ -123,8 +118,7 @@ impl WRRPicker {
         }
         Self {
             nodes,
-            cw: parking_lot::Mutex::new(0),
-            idx: parking_lot::Mutex::new(usize::MAX),
+            state: parking_lot::Mutex::new((usize::MAX, 0)),
             max_w,
             gcd_w: gcd_w.max(1),
             weights,
@@ -139,22 +133,20 @@ impl Picker for WRRPicker {
             return Err(LoadBalanceError::NoAvailableNodes);
         }
 
+        let mut state = self.state.lock();
+        let (ref mut i, ref mut cw) = *state;
+
         // Check if all node weights are 0
         if self.max_w <= 0 {
             // If all weights are 0, degrade to simple polling
-            let mut i = self.idx.lock();
             *i = if *i == usize::MAX { 0 } else { (*i + 1) % len };
             return Ok(self.nodes[*i].clone());
         }
 
-        let mut i = self.idx.lock();
-        let mut cw = self.cw.lock();
+        // Correct upper bound for one full WRR cycle: len * (max_w / gcd_w)
+        let max_attempts = len * (self.max_w / self.gcd_w) as usize;
 
-        // Prevent infinite loops, loop at most len*2 times
-        let mut attempts = 0;
-        let max_attempts = len * 2;
-
-        loop {
+        for _ in 0..max_attempts {
             *i = if *i == usize::MAX { 0 } else { (*i + 1) % len };
             if *i == 0 {
                 *cw = (*cw - self.gcd_w).max(0);
@@ -163,13 +155,14 @@ impl Picker for WRRPicker {
                 }
             }
 
-            // If a suitable node is found or too many attempts, return
-            if self.weights[*i] >= *cw || attempts >= max_attempts {
+            if self.weights[*i] >= *cw {
                 return Ok(self.nodes[*i].clone());
             }
-
-            attempts += 1;
         }
+
+        // Fallback: should not be reached with correct weights, but return first node
+        // with max weight as a safe default.
+        Ok(self.nodes[0].clone())
     }
 }
 
@@ -198,13 +191,8 @@ impl Picker for P2CPicker {
 
         let mut rng = rand::thread_rng();
         let a = rng.gen_range(0..len);
-
-        let b = loop {
-            let x = rng.gen_range(0..len);
-            if x != a {
-                break x;
-            }
-        };
+        // Guaranteed single-step selection of a different index
+        let b = (a + 1 + rng.gen_range(0..len - 1)) % len;
         let na = self.nodes[a]
             .in_flight
             .load(std::sync::atomic::Ordering::Acquire);
@@ -341,18 +329,18 @@ impl Picker for RTWeightedPicker {
         // Single pass O(n) selection; avoids allocation + sort on every pick
         let mut iter = self.nodes.iter();
         let first = iter.next().unwrap();
-        let mut best_node = first.clone();
+        let mut best_idx = 0usize;
         let mut best_score = score(first);
 
-        for node in iter {
+        for (offset, node) in iter.enumerate() {
             let s = score(node);
             if s > best_score {
                 best_score = s;
-                best_node = node.clone();
+                best_idx = offset + 1;
             }
         }
 
-        Ok(best_node)
+        Ok(self.nodes[best_idx].clone())
     }
 }
 
@@ -429,7 +417,7 @@ impl ConsistentHashPicker {
             for j in 0..vnode_count {
                 // Generate hash value using node address and virtual node index
                 let key = format!("{base_key}#{j}");
-                let hash = hash_str(&key);
+                let hash = ahash_value(&key);
                 ring.push((hash, i));
             }
         }
@@ -451,12 +439,12 @@ impl Picker for ConsistentHashPicker {
         // If there are no virtual nodes, degrade to simple hashing
         if self.ring.is_empty() {
             let key = req.hash_key.ok_or(LoadBalanceError::MissingHashKey)?;
-            let idx = (hash64(key) % (len as u64)) as usize;
+            let idx = (ahash_value(&key) % (len as u64)) as usize;
             return Ok(self.nodes[idx].clone());
         }
 
         let key = req.hash_key.ok_or(LoadBalanceError::MissingHashKey)?;
-        let hash = hash64(key);
+        let hash = ahash_value(&key);
 
         // Binary search to find the first position greater than or equal to hash
         match self.ring.binary_search_by(|&(h, _)| h.cmp(&hash)) {
@@ -475,10 +463,16 @@ impl Picker for ConsistentHashPicker {
     }
 }
 
-// Hash a string
-fn hash_str(s: &str) -> u64 {
+/// Compute a hash for any `Hash`-able value using AHasher.
+///
+/// NOTE: `AHasher::default()` is seeded with a fixed (but platform-dependent) seed.
+/// Hash values are **not** stable across different process invocations or builds,
+/// so they must not be persisted or shared between processes. This is acceptable for
+/// in-process load-balancing decisions (e.g. consistent-hash ring lookups) but would
+/// be incorrect for cross-process consistency.
+fn ahash_value<T: Hash>(val: &T) -> u64 {
     let mut h = AHasher::default();
-    s.hash(&mut h);
+    val.hash(&mut h);
     h.finish()
 }
 
@@ -551,10 +545,23 @@ mod tests {
         // The node with weight 2 should be selected with a probability of approximately 2/3
         assert!(counts[0] > (counts[1] as f64 * 1.5) as usize);
     }
-}
 
-fn hash64(v: u64) -> u64 {
-    let mut h = AHasher::default();
-    v.hash(&mut h);
-    h.finish()
+    #[test]
+    fn test_ahash_value_deterministic() {
+        let a = ahash_value(&"hello");
+        let b = ahash_value(&"hello");
+        assert_eq!(a, b, "same input must produce the same hash");
+    }
+
+    #[test]
+    fn test_ahash_value_different_types() {
+        let h_str = ahash_value(&"42");
+        let h_u64 = ahash_value(&42u64);
+        // Different types with "same content" should (almost certainly) differ.
+        assert_ne!(h_str, h_u64);
+
+        // Also verify determinism for numeric types.
+        assert_eq!(ahash_value(&100u32), ahash_value(&100u32));
+        assert_eq!(ahash_value(&(1u16, 2u16)), ahash_value(&(1u16, 2u16)));
+    }
 }

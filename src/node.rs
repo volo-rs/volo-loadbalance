@@ -31,19 +31,31 @@ impl Node {
         }
     }
 
+    /// Create a new node with the given endpoint and weight, preserving
+    /// runtime metrics (in-flight, success, fail, RTT) from `self`.
+    ///
+    /// Loads use `Acquire` ordering to ensure we see the most recent writes
+    /// from other threads. Stores use `Relaxed` because the newly created
+    /// node is not yet shared.
     pub fn clone_with_metadata(&self, endpoint: Endpoint, weight: u32) -> Self {
-        let node = Self::new(endpoint, weight);
-        let in_flight = self.in_flight.load(Ordering::Relaxed);
-        let success = self.success.load(Ordering::Relaxed);
-        let fail = self.fail.load(Ordering::Relaxed);
-        let last_rtt = self.last_rtt_ns.load(Ordering::Relaxed);
+        let in_flight = self.in_flight.load(Ordering::Acquire);
+        let success = self.success.load(Ordering::Acquire);
+        let fail = self.fail.load(Ordering::Acquire);
+        let last_rtt = self.last_rtt_ns.load(Ordering::Acquire);
 
-        let cloned = node;
-        cloned.in_flight.store(in_flight, Ordering::Relaxed);
-        cloned.success.store(success, Ordering::Relaxed);
-        cloned.fail.store(fail, Ordering::Relaxed);
-        cloned.last_rtt_ns.store(last_rtt, Ordering::Relaxed);
+        Self {
+            endpoint,
+            weight,
+            in_flight: AtomicUsize::new(in_flight),
+            success: AtomicU64::new(success),
+            fail: AtomicU64::new(fail),
+            last_rtt_ns: AtomicU64::new(last_rtt),
+        }
+    }
+}
 
-        cloned
+impl Clone for Node {
+    fn clone(&self) -> Self {
+        self.clone_with_metadata(self.endpoint.clone(), self.weight)
     }
 }
